@@ -12,6 +12,8 @@ import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover
 import { Calendar } from "@/components/ui/calendar";
 import { TimePicker } from "@/components/ui/time-picker";
 import { SocketStatusCard } from "@/components/ui/socket-status-card";
+import { MessageSquare } from "lucide-react"; 
+import ChatWindow from "@/components/ChatWindow"; 
 
 interface MarkerWithId { marker: google.maps.Marker; userId: string; }
 
@@ -53,7 +55,7 @@ export default function MapPage() {
   const [time, setTime] = useState("09:00");
   const [price, setPrice] = useState("150"); 
   
-  // --- POOLING STATES ---
+  // Pooling States
   const [seats, setSeats] = useState("3");       // Driver: Total Capacity
   const [passengers, setPassengers] = useState("1"); // Rider: Seats Needed
 
@@ -67,15 +69,17 @@ export default function MapPage() {
   const [riderRequestId, setRiderRequestId] = useState<string>(""); 
   const [incomingOffer, setIncomingOffer] = useState<any | null>(null);
 
+  // Chat States
+  const [activeDriveId, setActiveDriveId] = useState<string | null>(null);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+
   // ----------------------------------------------------------------
   // 2. MOUNT & INIT
   // ----------------------------------------------------------------
   useEffect(() => {
     setIsMounted(true);
-    const storedUserId = localStorage.getItem("userId");
-    const storedRole = localStorage.getItem("role") as "driver" | "rider";
-    setUserId(storedUserId);
-    setRole(storedRole);
+    setUserId(localStorage.getItem("userId"));
+    setRole(localStorage.getItem("role") as any);
   }, []);
 
   // ----------------------------------------------------------------
@@ -159,7 +163,7 @@ export default function MapPage() {
     s.on("connect", () => {
       setSocketStatus("connected");
       setSocketDetails(`ID: ${s.id}`);
-      s.emit("register", { userId, role }); // Immediate Register
+      s.emit("register", { userId, role });
       if (locationRef.current) registerUser(s, userId, role, locationRef.current.lat, locationRef.current.lng);
     });
     s.on("disconnect", (reason) => { setSocketStatus("disconnected"); setSocketDetails(reason); });
@@ -173,9 +177,15 @@ export default function MapPage() {
 
     // RIDER: Receive Acceptance
     s.on("negotiate:accept", (data: any) => {
-      alert(`🎉 Driver Accepted! Booking Confirmed for ₹${data.finalPrice}`);
+      alert(`🎉 Booking Confirmed!`);
       setMatches([]); 
-      setSuccess("Ride Confirmed! Proceed to pickup.");
+      setSuccess("Ride Confirmed! You can now chat.");
+      
+      // AUTO-OPEN CHAT
+      if (data.driveId) {
+          setActiveDriveId(data.driveId);
+          setIsChatOpen(true);
+      }
     });
     return () => { s.disconnect(); socketRef.current = null; };
   }, [isMounted, userId, role]);
@@ -236,10 +246,10 @@ export default function MapPage() {
         dropoff: { lat: finalDropoff.lat, lng: finalDropoff.lng, address: dropoffAddr },
         date: dateStr, 
         time, 
-        overview_polyline: overviewPolyline, // <--- FIXED HERE
+        overview_polyline: overviewPolyline,
         price: role === "driver" ? price : undefined,
-        seats: role === "driver" ? seats : undefined,       // Driver sends Total
-        passengers: role === "rider" ? passengers : undefined // Rider sends Need
+        seats: role === "driver" ? seats : undefined,
+        passengers: role === "rider" ? passengers : undefined
       };
       
       const res = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}${endpoint}`, {
@@ -258,7 +268,6 @@ export default function MapPage() {
     } catch (err: any) { setFormError(err.message); } finally { setLoading(false); }
   }
 
-  // --- RIDER START NEGOTIATION ---
   const handleNegotiate = (match: any) => {
       const offerPrice = prompt(`Driver has ${match.seats} seats. Price ₹${match.price}/seat. Offer:`, match.price);
       if (!offerPrice || !socketRef.current) return;
@@ -267,7 +276,7 @@ export default function MapPage() {
           riderId: userId,
           requestId: riderRequestId,
           driveId: match.driveId,
-          seatsNeeded: Number(passengers), // Tell driver how many we need
+          seatsNeeded: Number(passengers),
           pickup: match.pickup,
           dropoff: match.dropoff,
           originalPrice: match.price,
@@ -276,7 +285,6 @@ export default function MapPage() {
       alert("Offer Sent!");
   };
 
-  // --- DRIVER ACCEPT OFFER (CALLS API NOW) ---
   const handleAcceptOffer = async () => {
     if (!incomingOffer) return;
     try {
@@ -291,14 +299,18 @@ export default function MapPage() {
                 priceOffered: incomingOffer.offeredPrice
             })
         });
-        if (!res.ok) throw new Error("Booking Failed (Seats might be full)");
+        if (!res.ok) throw new Error("Booking Failed");
         
+        setActiveDriveId(incomingOffer.driveId);
+        setIsChatOpen(true);
         setIncomingOffer(null);
-        alert("Ride Accepted & Seats Deducted!");
-        setSuccess("Booking Confirmed.");
-    } catch (err: any) {
-        alert(err.message);
-    }
+        alert("Ride Accepted!");
+    } catch (err: any) { alert(err.message); }
+  };
+
+  const openDriverChat = (driveId: string) => {
+      setActiveDriveId(driveId);
+      setIsChatOpen(true);
   };
 
   if (!isMounted) return null;
@@ -308,6 +320,29 @@ export default function MapPage() {
       <div ref={mapRef} className="w-full h-full" />
       {error && <div className="absolute top-2 left-2 bg-white p-2 rounded text-red-600 z-50 shadow">{error}</div>}
       <SocketStatusCard status={socketStatus} userId={userId ?? undefined} details={socketDetails} />
+
+      {/* --- FLOATING CHAT BUTTON --- */}
+      {activeDriveId && !isChatOpen && (
+          <Button 
+            className="absolute bottom-24 right-4 z-50 rounded-full h-14 w-14 shadow-xl bg-blue-600 hover:bg-blue-700 animate-bounce"
+            onClick={() => setIsChatOpen(true)}
+          >
+            <MessageSquare className="h-6 w-6 text-white" />
+          </Button>
+      )}
+
+      {/* --- CHAT WINDOW --- */}
+      {isChatOpen && activeDriveId && userId && role && socketRef.current && (
+          <div className="absolute bottom-24 right-4 z-50">
+              <ChatWindow 
+                socket={socketRef.current}
+                driveId={activeDriveId}
+                userId={userId}
+                role={role}
+                onClose={() => setIsChatOpen(false)}
+              />
+          </div>
+      )}
 
       {/* --- DRIVER POPUP --- */}
       {incomingOffer && role === "driver" && (
@@ -374,6 +409,27 @@ export default function MapPage() {
               {success && <div className="text-green-600 text-sm">{success}</div>}
               <Button type="submit" className="w-full" disabled={loading}>{loading ? "Processing..." : (role === "driver" ? "Publish Route" : "Search Rides")}</Button>
             </form>
+
+            {/* DRIVER ACTIVE DRIVES LIST */}
+            {role === "driver" && myDrives.length > 0 && (
+              <div className="mt-8 border-t pt-4">
+                <h3 className="font-semibold text-gray-700 mb-2">Your Active Routes</h3>
+                <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
+                  {myDrives.map((drive) => (
+                    <div key={drive.id} className="p-3 bg-gray-50 rounded border text-sm flex justify-between items-center shadow-sm">
+                      <div className="overflow-hidden">
+                        <p className="font-bold text-gray-800">{drive.date} @ {drive.time}</p>
+                        <p className="text-xs text-gray-500 truncate w-40">{drive.dropoff.address.split(',')[0]}...</p>
+                      </div>
+                      <div className="text-right flex items-center gap-2">
+                          <span className="block font-bold text-green-700">₹{drive.price}</span>
+                          <Button size="sm" variant="outline" onClick={() => openDriverChat(drive.id)}>Chat</Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>
