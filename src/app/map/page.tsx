@@ -12,7 +12,7 @@ import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover
 import { Calendar } from "@/components/ui/calendar";
 import { TimePicker } from "@/components/ui/time-picker";
 import { SocketStatusCard } from "@/components/ui/socket-status-card";
-// Ensure this path matches your project structure
+// We use 'any' for negotiation payloads to avoid type errors if you haven't updated types.ts yet
 import { OfferPayload, RideUpdatePayload } from "@/types/socket";
 
 interface MarkerWithId {
@@ -58,15 +58,18 @@ export default function MapPage() {
   const [dropoffLL, setDropoffLL] = useState<{ lat: number; lng: number } | null>(null);
   const [date, setDate] = useState<Date | undefined>(new Date());
   const [time, setTime] = useState("09:00");
+  const [price, setPrice] = useState("150"); // New Price State
   const [loading, setLoading] = useState(false);
   const [formError, setFormError] = useState("");
   const [success, setSuccess] = useState("");
   
-  // Driver: List of Published Drives
-  const [myDrives, setMyDrives] = useState<any[]>([]);
-
-  // Driver: Incoming Request Popup
-  const [incomingOffer, setIncomingOffer] = useState<OfferPayload | null>(null);
+  // --- NEW MARKETPLACE STATES ---
+  const [myDrives, setMyDrives] = useState<any[]>([]); // Driver: My Published Routes
+  const [matches, setMatches] = useState<any[]>([]);   // Rider: List of Drivers found
+  const [riderRequestId, setRiderRequestId] = useState<string>(""); // Rider: Current Request ID
+  
+  // Driver: Incoming Negotiation Popup
+  const [incomingOffer, setIncomingOffer] = useState<any | null>(null);
 
   // ----------------------------------------------------------------
   // 2. MOUNT & INIT
@@ -201,7 +204,7 @@ export default function MapPage() {
 
 
   // ----------------------------------------------------------------
-  // 5. SOCKET CONNECTION
+  // 5. SOCKET CONNECTION & NEGOTIATION LOGIC
   // ----------------------------------------------------------------
   useEffect(() => {
     if (!isMounted || !userId || !role) return;
@@ -215,6 +218,13 @@ export default function MapPage() {
       console.log("🟢 Socket Connected:", s.id);
       setSocketStatus("connected");
       setSocketDetails(`ID: ${s.id}`);
+      
+      // --- CRITICAL FIX: Register Immediately ---
+      // We do NOT wait for 'locationRef.current' to exist.
+      // This ensures the Driver joins their room instantly so they can receive offers.
+      s.emit("register", { userId, role });
+
+      // Update Location if available (for map markers)
       if (locationRef.current) {
         registerUser(s, userId, role, locationRef.current.lat, locationRef.current.lng);
       }
@@ -225,18 +235,19 @@ export default function MapPage() {
         setSocketDetails(reason);
     });
 
-    s.on("request:offer", (offer: OfferPayload) => {
-      console.log("🔔🔔🔔 NEW OFFER RECEIVED:", offer);
-      setIncomingOffer(offer); 
+    // --- DRIVER: Receive Offer from Rider ---
+    s.on("negotiate:offer", (data: any) => {
+      console.log("💰 Negotiation Received:", data);
+      setIncomingOffer(data); // Show Popup
       try { new Audio('/notification.mp3').play().catch(()=>{}); } catch(e){}
     });
 
-    s.on("ride:update", (update: RideUpdatePayload) => {
-      if (update.status === "ACCEPTED") {
-         setSuccess("Ride Matched!");
-         setIncomingOffer(null);
-         alert("Ride matched! Proceeding to pickup.");
-      }
+    // --- RIDER: Receive Acceptance from Driver ---
+    s.on("negotiate:accept", (data: any) => {
+      console.log("✅ Driver Accepted:", data);
+      alert(`🎉 Driver Accepted! Ride Confirmed for ₹${data.finalPrice}`);
+      setMatches([]); // Clear list as we are booked
+      setSuccess("Ride Confirmed! Proceed to pickup.");
     });
 
     return () => { s.disconnect(); socketRef.current = null; };
@@ -257,7 +268,7 @@ export default function MapPage() {
     return () => { if (connectionCheckInterval.current) clearInterval(connectionCheckInterval.current); };
   }, [userId, role]);
 
-  // Fetch Published Drives
+  // Fetch Published Drives (Driver Only)
   useEffect(() => {
     if (!userId || role !== "driver") return;
     const fetchDrives = async () => {
@@ -282,9 +293,10 @@ export default function MapPage() {
     e.preventDefault();
     setFormError("");
     setSuccess("");
+    setMatches([]); // Clear previous matches
     if (!userId) { setFormError("Missing user session."); return; }
 
-    // Geocoding Helper for fallback
+    // --- Geocoding Helper ---
     const getCoords = async (latLng: {lat: number, lng: number} | null, address: string, userLoc: {lat: number, lng: number} | null) => {
         if (latLng) return latLng;
         if (address && window.google) {
@@ -311,6 +323,7 @@ export default function MapPage() {
 
       if (!finalPickup || !finalDropoff) throw new Error("Could not find coordinates.");
 
+      // Driver: Calculate Polyline
       let overviewPolyline = "";
       if (role === "driver") {
          const ds = new google.maps.DirectionsService();
@@ -345,7 +358,8 @@ export default function MapPage() {
         dropoff: { lat: finalDropoff.lat, lng: finalDropoff.lng, address: dropoffAddr },
         date: dateStr,
         time: time,
-        overview_polyline: overviewPolyline 
+        overview_polyline: overviewPolyline,
+        price: role === "driver" ? price : undefined // Send Price if Driver
       };
       
       const res = await fetch(`${backendUrl}${endpoint}`, {
@@ -354,12 +368,20 @@ export default function MapPage() {
         body: JSON.stringify(body),
       });
       
-      if (!res.ok) throw new Error("Submission failed.");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Submission failed.");
       
       if (role === "driver") {
         setSuccess("Route Published!");
       } else {
-        setSuccess("Request Sent! Searching...");
+        // RIDER: Handle Matches List
+        setRiderRequestId(data.requestId);
+        if (data.matches && data.matches.length > 0) {
+            setMatches(data.matches);
+            setSuccess(`Found ${data.matches.length} matching drivers!`);
+        } else {
+            setSuccess("No matches found yet.");
+        }
       }
     } catch (err: any) {
       setFormError(err.message || "Error");
@@ -368,12 +390,38 @@ export default function MapPage() {
     }
   }
 
-  const handleAcceptRide = () => {
+  // --- RIDER: NEGOTIATE START ---
+  const handleNegotiate = (match: any) => {
+      const offerPrice = prompt(`Driver's Price is ₹${match.price}. Enter your offer:`, match.price);
+      if (!offerPrice || !socketRef.current) return;
+
+      console.log("📤 Sending Offer to Driver:", match.driverId);
+      
+      socketRef.current.emit("negotiate:start", {
+          targetDriverId: match.driverId,
+          riderId: userId,
+          requestId: riderRequestId,
+          driveId: match.driveId,
+          pickup: match.pickup, // pass details for popup context
+          dropoff: match.dropoff,
+          originalPrice: match.price,
+          offeredPrice: offerPrice
+      });
+      alert("Offer Sent! Waiting for driver response...");
+  };
+
+  // --- DRIVER: ACCEPT OFFER ---
+  const handleAcceptOffer = () => {
     if (!incomingOffer || !socketRef.current) return;
-    socketRef.current.emit("request:accept", { 
-      requestId: incomingOffer.requestId, 
-      eventId: incomingOffer.eventId 
+    
+    socketRef.current.emit("negotiate:respond", {
+        targetRiderId: incomingOffer.riderId,
+        status: "ACCEPTED",
+        finalPrice: incomingOffer.offeredPrice
     });
+    
+    setIncomingOffer(null); // Close popup
+    alert("You accepted the ride!");
   };
 
   if (!isMounted) return null;
@@ -385,20 +433,32 @@ export default function MapPage() {
       {error && <div className="absolute top-2 left-2 bg-white p-2 rounded text-red-600 z-50 shadow">{error}</div>}
       <SocketStatusCard status={socketStatus} userId={userId ?? undefined} details={socketDetails} />
 
-      {/* DRIVER POPUP */}
+      {/* --- DRIVER POPUP (NEGOTIATION) --- */}
       {incomingOffer && role === "driver" && (
         <div className="absolute top-24 left-0 right-0 mx-auto w-11/12 md:w-96 z-50">
           <Card className="border-4 border-green-500 shadow-2xl bg-white animate-in slide-in-from-top">
             <CardHeader className="bg-green-50 py-3">
-              <CardTitle className="text-green-700">🔔 New Ride Request</CardTitle>
+              <CardTitle className="text-green-700">💰 New Offer Received</CardTitle>
             </CardHeader>
             <CardContent className="pt-4 space-y-3">
               <div>
-                <span className="text-xs font-bold text-gray-500 uppercase">Pickup</span>
-                <p className="text-lg font-medium">{incomingOffer.pickup.address || "Location Pinned"}</p>
+                <span className="text-xs font-bold text-gray-500 uppercase">From Rider</span>
+                <p className="text-sm">They want to join your route.</p>
               </div>
+              
+              <div className="bg-gray-100 p-3 rounded flex justify-between items-center">
+                  <div>
+                      <p className="text-xs text-gray-500">Your Ask</p>
+                      <p className="text-sm line-through text-gray-400">₹{incomingOffer.originalPrice}</p>
+                  </div>
+                  <div className="text-right">
+                      <p className="text-xs text-gray-500">Rider Offers</p>
+                      <p className="text-xl font-bold text-green-700">₹{incomingOffer.offeredPrice}</p>
+                  </div>
+              </div>
+
               <div className="flex gap-3 mt-4">
-                <Button className="flex-1 bg-green-600 hover:bg-green-700 text-white" onClick={handleAcceptRide}>Accept</Button>
+                <Button className="flex-1 bg-green-600 hover:bg-green-700 text-white" onClick={handleAcceptOffer}>Accept</Button>
                 <Button className="flex-1" variant="destructive" onClick={() => setIncomingOffer(null)}>Decline</Button>
               </div>
             </CardContent>
@@ -406,79 +466,116 @@ export default function MapPage() {
         </div>
       )}
 
-      {/* Bottom Panel */}
+      {/* --- RIDER MATCH LIST (OVERLAY) --- */}
+      {role === "rider" && matches.length > 0 && (
+          <div className="absolute top-20 left-4 w-80 max-h-[60vh] overflow-y-auto z-40 space-y-3 pr-2">
+              {matches.map((m) => (
+                  <Card key={m.driveId} className="shadow-lg border-l-4 border-blue-500 bg-white hover:bg-blue-50 transition-colors">
+                      <CardContent className="p-4">
+                          <div className="flex justify-between items-center mb-1">
+                              <span className="font-bold text-xl text-blue-700">₹{m.price}</span>
+                              <span className="text-xs bg-gray-200 px-2 py-1 rounded font-mono">{m.time}</span>
+                          </div>
+                          <p className="text-xs text-gray-500 mb-3">Driver: {m.driverId.substring(0,8)}...</p>
+                          <Button size="sm" className="w-full bg-blue-600 hover:bg-blue-700" onClick={() => handleNegotiate(m)}>
+                              Make Offer / Book
+                          </Button>
+                      </CardContent>
+                  </Card>
+              ))}
+          </div>
+      )}
+
+      {/* --- MAIN FORM (BOTTOM) --- */}
       <div className="absolute bottom-0 left-0 right-0 w-full px-4 pb-4 z-40">
         <Card className="shadow-2xl bg-white/95 backdrop-blur max-h-[60vh] overflow-y-auto">
           <CardHeader>
-            <CardTitle>{role === "driver" ? "Publish Your Route" : "Request a Ride"}</CardTitle>
+            <CardTitle>{role === "driver" ? "Publish Route" : "Find a Ride"}</CardTitle>
           </CardHeader>
           <CardContent>
             <form onSubmit={handleSubmit} className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="pickup">{role === "driver" ? "Start Location" : "Pickup Location"}</Label>
-                <Input 
-                  id="pickup" 
-                  ref={pickupRef} 
-                  placeholder="Enter location" 
-                  required 
-                  value={pickupAddr} 
-                  onChange={e => {
-                    setPickupAddr(e.target.value);
-                    setPickupLL(null); // <--- FIXED: Clears old specific coords
-                  }} 
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="dropoff">{role === "driver" ? "Destination" : "Drop-off Location"}</Label>
-                <Input 
-                  id="dropoff" 
-                  ref={dropoffRef} 
-                  placeholder="Enter location" 
-                  required 
-                  value={dropoffAddr} 
-                  onChange={e => {
-                    setDropoffAddr(e.target.value);
-                    setDropoffLL(null); // <--- FIXED
-                  }} 
-                />
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                  <div className="space-y-1">
+                    <Label htmlFor="pickup">Pickup</Label>
+                    <Input 
+                      id="pickup" 
+                      ref={pickupRef} 
+                      placeholder="Enter location" 
+                      required 
+                      value={pickupAddr} 
+                      onChange={e => { setPickupAddr(e.target.value); setPickupLL(null); }} 
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="dropoff">Dropoff</Label>
+                    <Input 
+                      id="dropoff" 
+                      ref={dropoffRef} 
+                      placeholder="Enter location" 
+                      required 
+                      value={dropoffAddr} 
+                      onChange={e => { setDropoffAddr(e.target.value); setDropoffLL(null); }} 
+                    />
+                  </div>
               </div>
               
-              <div className="space-y-2">
-                <Label>Scheduled Date & Time</Label>
-                <div className="flex space-x-2">
-                  <Popover>
-                    <PopoverTrigger asChild>
-                      <Button variant="outline" className="w-[180px] justify-start text-left font-normal">
-                        {date ? date.toLocaleDateString() : <span>Pick a date</span>}
-                      </Button>
-                    </PopoverTrigger>
-                    <PopoverContent className="w-auto p-0">
-                      <Calendar mode="single" selected={date} onSelect={setDate} initialFocus />
-                    </PopoverContent>
-                  </Popover>
-                  <TimePicker value={time} onChange={setTime} disabled={loading} />
-                </div>
+              <div className="flex flex-wrap gap-2 items-end">
+                  <div className="flex-1 min-w-[140px] space-y-1">
+                      <Label>Date</Label>
+                      <Popover>
+                        <PopoverTrigger asChild>
+                          <Button variant="outline" className="w-full justify-start text-left font-normal">
+                            {date ? date.toLocaleDateString() : <span>Pick date</span>}
+                          </Button>
+                        </PopoverTrigger>
+                        <PopoverContent className="w-auto p-0">
+                          <Calendar mode="single" selected={date} onSelect={setDate} initialFocus />
+                        </PopoverContent>
+                      </Popover>
+                  </div>
+                  <div className="w-[120px] space-y-1">
+                      <Label>Time</Label>
+                      <TimePicker value={time} onChange={setTime} disabled={loading} />
+                  </div>
+                  
+                  {/* Price Input for Driver */}
+                  {role === "driver" && (
+                      <div className="w-[100px] space-y-1">
+                          <Label>Price (₹)</Label>
+                          <Input 
+                            type="number" 
+                            placeholder="150" 
+                            value={price} 
+                            onChange={e => setPrice(e.target.value)} 
+                            className="font-bold"
+                          />
+                      </div>
+                  )}
               </div>
 
               {formError && <div className="text-red-500 text-sm">{formError}</div>}
               {success && <div className="text-green-600 text-sm">{success}</div>}
               
               <Button type="submit" className="w-full" disabled={loading}>
-                {loading ? "Processing..." : (role === "driver" ? "Publish Route" : "Find Ride")}
+                {loading ? "Processing..." : (role === "driver" ? "Publish Route" : "Search Available Rides")}
               </Button>
             </form>
             
+            {/* Driver's Published List */}
             {role === "driver" && myDrives.length > 0 && (
               <div className="mt-8 border-t pt-4">
-                <h3 className="font-semibold text-gray-700 mb-2">Your Published Routes</h3>
+                <h3 className="font-semibold text-gray-700 mb-2">Your Active Routes</h3>
                 <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
                   {myDrives.map((drive) => (
                     <div key={drive.id} className="p-3 bg-gray-50 rounded border text-sm flex justify-between items-center shadow-sm">
                       <div className="overflow-hidden">
-                        <p className="font-bold text-gray-800">{drive.date} <span className="text-gray-400 font-normal">at</span> {drive.time}</p>
-                        <p className="text-xs text-gray-500 truncate w-48">{drive.dropoff.address.split(',')[0]}...</p>
+                        <p className="font-bold text-gray-800">{drive.date} @ {drive.time}</p>
+                        <p className="text-xs text-gray-500 truncate w-40">{drive.dropoff.address.split(',')[0]}...</p>
                       </div>
-                      <span className="px-2 py-1 rounded text-[10px] uppercase bg-green-100 text-green-700">{drive.status}</span>
+                      <div className="text-right">
+                          <span className="block font-bold text-green-700">₹{drive.price}</span>
+                          <span className="text-[10px] uppercase text-gray-400">{drive.status}</span>
+                      </div>
                     </div>
                   ))}
                 </div>
